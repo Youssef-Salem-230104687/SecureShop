@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h1>Login behavior</h1><p>Typing-speed mean: {{mean}}; population σ: {{stdev}}</p><table class="table"><tr><th>Typing speed</th><th>Request ms</th><th>Device</th></tr>{% for r in rows %}<tr><td>{{r.typing_speed}}</td><td>{{r.request_ms}}</td><td>{{r.device_id}}</td></tr>{% endfor %}</table>{% endblock %}

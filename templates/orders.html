@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h1>Order history</h1>{% for o in orders %}<p><a href="{{url_for('order_detail',order_id=o.id)}}">Order #{{o.id}}</a> — ${{o.total_amount}} — {{o.status}}</p>{% else %}<p>No orders yet.</p>{% endfor %}{% endblock %}

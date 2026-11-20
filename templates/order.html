@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h1>Order #{{order.id}}</h1><p>Customer: {{order.username}}</p><p>Total: ${{order.total_amount}} · {{order.status}}</p>{% for i in items %}<p>{{i.name}} × {{i.quantity}} at ${{i.unit_price}}</p>{% endfor %}{% endblock %}
