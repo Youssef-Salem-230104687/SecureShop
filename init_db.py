@@ -7,7 +7,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "secureshop.db")
 
 SCHEMA = '''
-CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', is_verified INTEGER DEFAULT 0, verification_code TEXT, store_credit REAL DEFAULT 500.0, failed_attempts INTEGER DEFAULT 0, last_login_ip TEXT, device_id TEXT);
+CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', is_verified INTEGER DEFAULT 0, verification_code TEXT, store_credit REAL DEFAULT 500.0, failed_attempts INTEGER DEFAULT 0, last_login_ip TEXT, device_id TEXT, verification_attempts INTEGER DEFAULT 0, verification_code_expires_at TEXT, locked_until TEXT);
 CREATE TABLE products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, price REAL NOT NULL CHECK(price >= 0), stock INTEGER DEFAULT 0 CHECK(stock >= 0), image_filename TEXT);
 CREATE TABLE coupons (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, discount_percent INTEGER NOT NULL CHECK(discount_percent BETWEEN 1 AND 100), is_used INTEGER DEFAULT 0, usage_count INTEGER DEFAULT 0, assigned_email TEXT, expires_at TEXT, max_uses INTEGER NOT NULL DEFAULT 1, min_purchase REAL NOT NULL DEFAULT 0);
 CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, total_amount REAL NOT NULL CHECK(total_amount >= 0), coupon_used TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id));
