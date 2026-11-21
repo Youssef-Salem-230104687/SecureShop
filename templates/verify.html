@@ -1,1 +1,32 @@
-{% extends 'base.html' %}{% block content %}<div class="form-shell"><span class="eyebrow">ACCOUNT ACTIVATION</span><h1>Confirm your account</h1><p class="text-secondary">Enter the confirmation code that was issued for your account.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label class="form-label">Email address</label><input class="form-control mb-3" type="email" name="email" value="{{ email }}" required><label class="form-label">Confirmation code</label><input class="form-control mb-4" name="code" required autocomplete="one-time-code"><button class="btn btn-primary w-100">Confirm account</button></form></div>{% endblock %}
+{% extends 'base.html' %}
+{% block title %}Confirm Account – SecureShop{% endblock %}
+{% block content %}
+<div class="form-shell">
+  <span class="eyebrow">ACCOUNT ACTIVATION</span>
+  <h1>Confirm your account</h1>
+  <p class="text-secondary">Enter the confirmation code that was issued when you registered.</p>
+
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <div class="mb-3">
+      <label class="form-label" for="verify-email">Email address</label>
+      <input class="form-control" id="verify-email" type="email" name="email"
+             value="{{ email }}" required autocomplete="email"
+             placeholder="you@example.com">
+    </div>
+
+    <div class="mb-4">
+      <label class="form-label" for="verify-code">Confirmation code</label>
+      <input class="form-control" id="verify-code" name="code" required
+             autocomplete="one-time-code" placeholder="Paste your code here">
+    </div>
+
+    <button class="btn btn-primary w-100 py-2" type="submit">Confirm account</button>
+  </form>
+
+  <p class="text-secondary small mt-3 mb-0 text-center">
+    Already confirmed? <a href="{{ url_for('login') }}">Sign in</a>
+  </p>
+</div>
+{% endblock %}
