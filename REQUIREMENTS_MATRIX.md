@@ -1,12 +1,13 @@
 # Requirements Matrix
 
-| ID | Requirement | Application Component | Test Case | Implementation Status | Evidence |
-|---|---|---|---|---|---|
-| R1 | Flask/SQLite e-commerce workflow | `app.py`, templates | `test_catalog_renders` | Verified | pytest |
-| R2 | SQL injection | `login`, `products` | `test_sqli_login_bypasses_password` | Verified | pytest |
-| R3 | IDOR | `order_detail` | `test_idor_order_read` | Verified | pytest |
-| R4 | Client price/quantity trust | `checkout`, `cart_update` | `test_client_price_is_stored` | Verified | pytest |
-| R5 | Path traversal | `/download` | `test_path_traversal_reads_synthetic_parent_file` | Verified | pytest |
-| R6 | Coupon concurrency | `checkout` | `test_single_use_coupon_redeemed_twice_concurrently` | Verified | pytest |
-| R7 | XSS review rendering | `product.html` | Manual browser procedure | Implemented, manual | ATTACK_DEMONSTRATION.md |
-| R8 | Context authentication weakness | `/context-auth`, `/context-login` | Manual request matrix | Implemented, manual | ATTACK_DEMONSTRATION.md |
+| Area | Implementation | Verification |
+|---|---|---|
+| Authentication and activation | Validated registration, hashed passwords, one-time confirmation token, verified-only login, server-side session identity | Registration/confirmation/login test |
+| Catalogue | Search, detail pages, stock badges, empty search state | Catalogue test and smoke pass |
+| Cart | Session cart, validated add/update/remove operations, calculated totals | Checkout workflow test |
+| Coupons and newsletter | Eligibility/expiry/assignment/use rules; subscription issues an email-assigned coupon | Newsletter and coupon race tests |
+| Checkout and orders | Atomic server-side total, inventory, coupon, and store-credit transaction; order history | Checkout workflow and authorization test |
+| Account | Profile update, credit display, recent orders | Route and template smoke pass |
+| Administration | Database-backed role gate and user/product/coupon management routes | Authorization and product management test |
+| Security | CSRF, parameterized SQL, hashed passwords, ownership checks, safe downloads, non-verbose errors | CSRF/private-order/path tests |
+| Responsive UI | Bootstrap 5 layouts, responsive navigation, cards, forms, empty states, tables, alerts | Source and response smoke pass |

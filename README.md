@@ -1,6 +1,6 @@
-# SecureShop Naive
+# SecureShop
 
-SecureShop is a local Flask/SQLite e-commerce application intentionally implemented with common security weaknesses for controlled academic testing. It must remain bound to localhost; it is not a production application.
+SecureShop is a Flask and SQLite e-commerce application with a responsive Bootstrap 5 storefront. It supports account activation, a session cart, store-credit checkout, order history, newsletter welcome coupons, and an administrator console.
 
 ## Run
 
@@ -12,10 +12,14 @@ python init_db.py
 python app.py
 ```
 
-Open http://127.0.0.1:5000. Seed accounts are `alice` / `alice-demo-pass`, `bob` / `bob123`, and `admin` / `admin123`. Reset with `python init_db.py`.
+Open http://127.0.0.1:5000. The development seed accounts are:
 
-Run the reproducible local checks with `pytest -q`. All accounts and files are synthetic.
+- `alice` / `alice-demo-pass`
+- `bob` / `bob123secure`
+- `admin` / `admin123secure`
 
-## Scope
+Reset the development database with `python init_db.py`, then run the checks with `pytest -q`.
 
-The app demonstrates SQL injection (`/login`, `/products`), XSS in product reviews, IDOR on `/orders/<id>`, weak plaintext passwords and predictable verification codes, insecure session configuration, client-trusted checkout prices/quantities, a non-atomic coupon update, path traversal (`/download` and `/files`), verbose error details, behavioral statistics, and client-controlled context-authentication gates. The implementation deliberately does not provide a secure alternative.
+## Security controls
+
+State-changing forms include CSRF tokens. Passwords use Werkzeug password hashes, role checks come from the server-side database, all SQL receives parameterized values, and checkout recalculates prices, coupon eligibility, inventory, and credit inside a SQLite transaction. Private orders have ownership checks; download names are constrained to their intended directories. Set a persistent `SECRET_KEY` and enable HTTPS (`FLASK_ENV=production`) when deploying.

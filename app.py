@@ -1,329 +1,557 @@
+import hmac
 import os
-import sqlite3
+import re
 import secrets
-import hashlib
-import math
-import statistics
-from datetime import datetime
-from flask import Flask, request, session, redirect, url_for, render_template, flash, jsonify, send_file
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+from pathlib import Path
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "secureshop.db")
-UPLOAD_DIR = os.path.join(BASE_DIR, "test_files")
+from flask import Flask, abort, flash, redirect, render_template, request, send_file, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
 
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "secureshop.db"
+UPLOAD_DIR, DEMO_DIR = BASE_DIR / "test_files", BASE_DIR / "demo_files"
 app = Flask(__name__)
-app.secret_key = "secureshop-naive-development-key"
-app.config.update(SESSION_COOKIE_HTTPONLY=False, SESSION_COOKIE_SECURE=False, SESSION_COOKIE_SAMESITE=None)
+app.config.update(SECRET_KEY=os.environ.get("SECRET_KEY", secrets.token_hex(32)),
+                  SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  SESSION_COOKIE_SECURE=os.environ.get("FLASK_ENV") == "production")
 
 def db():
-    conn = sqlite3.connect(app.config.get("DATABASE_PATH", DB_PATH), timeout=5)
+    conn = sqlite3.connect(app.config.get("DATABASE_PATH", str(DB_PATH)), timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
+def now():
+    return datetime.now(timezone.utc)
+
+def migrate_database():
+    with db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS newsletter_subscribers (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
+              coupon_code TEXT NOT NULL, subscribed_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS audit_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, user_id INTEGER,
+              detail TEXT, ip TEXT, created_at TEXT NOT NULL);
+        """)
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(coupons)")}
+        for name, definition in {"expires_at": "TEXT", "max_uses": "INTEGER NOT NULL DEFAULT 1",
+                                 "min_purchase": "REAL NOT NULL DEFAULT 0"}.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE coupons ADD COLUMN {name} {definition}")
+        # One-time safe upgrade from this project's former plaintext demo data.
+        for user in conn.execute("SELECT id,password_hash FROM users"):
+            if not user["password_hash"].startswith(("pbkdf2:", "scrypt:")):
+                conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                             (generate_password_hash(user["password_hash"]), user["id"]))
+        conn.commit()
+
 def current_user():
-    uid = session.get("user_id")
-    if not uid:
+    if not session.get("user_id"):
         return None
     with db() as conn:
-        return conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        return conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
 
 def audit(event, user_id=None, detail=""):
     with db() as conn:
-        conn.execute("INSERT INTO audit_events(event,user_id,detail,ip,created_at) VALUES (?,?,?,?,?)", (event, user_id, detail, request.remote_addr, datetime.utcnow().isoformat()))
+        conn.execute("INSERT INTO audit_events(event,user_id,detail,ip,created_at) VALUES (?,?,?,?,?)",
+                     (event, user_id, detail[:500], request.remote_addr, now().isoformat()))
         conn.commit()
 
-def haversine_km(lat1, lon1, lat2, lon2):
-    radius = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = math.radians(lat2-lat1), math.radians(lon2-lon1)
-    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-    return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            flash("Please sign in to continue.", "warning")
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+    return wrapped
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user = current_user()
+        if not user:
+            flash("Please sign in to continue.", "warning")
+            return redirect(url_for("login"))
+        if user["role"] != "admin":
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapped
+
+def money(raw):
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("Enter a valid amount.")
+    if value < 0 or value > 1_000_000:
+        raise ValueError("Enter an amount between 0 and 1,000,000.")
+    return round(value, 2)
+
+def positive_int(raw, label="quantity", maximum=999):
+    try:
+        number = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Enter a valid {label}.")
+    if not 1 <= number <= maximum:
+        raise ValueError(f"{label.capitalize()} must be between 1 and {maximum}.")
+    return number
+
+def validate_email(email):
+    email = (email or "").strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise ValueError("Enter a valid email address.")
+    return email
+
+def validate_username(username):
+    username = (username or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", username):
+        raise ValueError("Username must be 3–32 letters, numbers, dots, dashes, or underscores.")
+    return username
+
+def cart_items(conn=None):
+    cart = session.get("cart", {})
+    try:
+        ids = [int(k) for k, v in cart.items() if int(v) > 0]
+    except (ValueError, TypeError):
+        session["cart"] = {}
+        return []
+    if not ids:
+        return []
+    close, conn = conn is None, conn or db()
+    try:
+        products = {p["id"]: p for p in conn.execute(
+            "SELECT * FROM products WHERE id IN (" + ",".join("?" for _ in ids) + ")", ids)}
+        return [(products[pid], int(cart[str(pid)])) for pid in ids if pid in products]
+    finally:
+        if close:
+            conn.close()
+
+def eligible_coupon(conn, raw_code, user, subtotal):
+    code = (raw_code or "").strip().upper()
+    if not code:
+        return None, None
+    coupon = conn.execute("SELECT * FROM coupons WHERE code=?", (code,)).fetchone()
+    if not coupon:
+        return None, "Coupon code was not found."
+    expiry = coupon["expires_at"]
+    try:
+        expired = bool(expiry) and datetime.fromisoformat(expiry).replace(tzinfo=timezone.utc) <= now()
+    except ValueError:
+        expired = True
+    assigned = bool(coupon["assigned_email"]) and coupon["assigned_email"].lower() != user["email"].lower()
+    if expired or assigned or coupon["is_used"] or coupon["usage_count"] >= coupon["max_uses"] or subtotal < coupon["min_purchase"]:
+        return None, "This coupon is not eligible for this order."
+    return coupon, None
+
+@app.before_request
+def csrf_protection():
+    if request.method == "POST":
+        token = request.form.get("csrf_token", "")
+        if not token or not hmac.compare_digest(token, session.get("csrf_token", "")):
+            abort(400)
 
 @app.context_processor
-def inject_user():
-    return {"current_user": current_user(), "cart_count": sum(session.get("cart", {}).values()) if session.get("cart") else 0}
+def context():
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    cart = session.get("cart", {})
+    return {"current_user": current_user(), "csrf_token": session["csrf_token"],
+            "cart_count": sum(int(v) for v in cart.values() if str(v).isdigit())}
 
 @app.route("/")
 def index():
     with db() as conn:
-        products = conn.execute("SELECT * FROM products ORDER BY id").fetchall()
+        products = conn.execute("SELECT * FROM products WHERE stock > 0 ORDER BY id LIMIT 4").fetchall()
     return render_template("index.html", products=products)
 
 @app.route("/products")
 def products():
-    query = request.args.get("q", "")
+    query = request.args.get("q", "").strip()
     with db() as conn:
-        # [INTENTIONAL-VULNERABILITY: SQL Injection - naive search concatenates untrusted input]
         if query:
-            rows = conn.execute("SELECT * FROM products WHERE name LIKE '%" + query + "%' OR description LIKE '%" + query + "%'").fetchall()
+            like = f"%{query}%"
+            rows = conn.execute("SELECT * FROM products WHERE name LIKE ? OR description LIKE ? ORDER BY name", (like, like)).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM products").fetchall()
+            rows = conn.execute("SELECT * FROM products ORDER BY name").fetchall()
     return render_template("products.html", products=rows, query=query)
 
 @app.route("/product/<int:product_id>")
 def product_detail(product_id):
     with db() as conn:
         product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
-        reviews = conn.execute("SELECT r.*,u.username FROM reviews r LEFT JOIN users u ON u.id=r.user_id WHERE product_id=? ORDER BY r.id DESC", (product_id,)).fetchall()
+        reviews = conn.execute("SELECT r.*,u.username FROM reviews r LEFT JOIN users u ON u.id=r.user_id WHERE r.product_id=? ORDER BY r.id DESC", (product_id,)).fetchall()
     if not product:
-        return "Product not found", 404
+        abort(404)
     return render_template("product.html", product=product, reviews=reviews)
 
 @app.route("/product/<int:product_id>/review", methods=["POST"])
+@login_required
 def review(product_id):
-    user = current_user()
-    if not user:
-        flash("Please log in to review products.", "warning"); return redirect(url_for("login"))
-    with db() as conn:
-        conn.execute("INSERT INTO reviews(product_id,user_id,body,created_at) VALUES (?,?,?,?)", (product_id, user["id"], request.form.get("body", ""), datetime.utcnow().isoformat()))
-        conn.commit()
+    body = request.form.get("body", "").strip()
+    if not 1 <= len(body) <= 1000:
+        flash("Reviews must be between 1 and 1,000 characters.", "danger")
+    else:
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM products WHERE id=?", (product_id,)).fetchone():
+                abort(404)
+            conn.execute("INSERT INTO reviews(product_id,user_id,body,created_at) VALUES (?,?,?,?)",
+                         (product_id, current_user()["id"], body, now().isoformat()))
+            conn.commit()
+        flash("Thanks for sharing your review.", "success")
     return redirect(url_for("product_detail", product_id=product_id))
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
-        username, email, password = request.form.get("username", ""), request.form.get("email", ""), request.form.get("password", "")
-        # [INTENTIONAL-VULNERABILITY: Password Storage - plaintext credentials are stored]
-        code = str((len(username) * 1000 + len(email)) % 10000).zfill(4)
         try:
+            username, email = validate_username(request.form.get("username")), validate_email(request.form.get("email"))
+            password = request.form.get("password", "")
+            if len(password) < 10 or not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+                raise ValueError("Use a password of at least 10 characters with letters and numbers.")
+            confirmation_code = secrets.token_urlsafe(18)
             with db() as conn:
-                conn.execute("INSERT INTO users(username,email,password_hash,role,is_verified,verification_code,store_credit,failed_attempts,device_id) VALUES (?,?,?,?,?,?,?,?,?)", (username,email,password,"user",0,code,500.0,0,request.form.get("device_id", "")))
+                conn.execute("INSERT INTO users(username,email,password_hash,role,is_verified,verification_code,store_credit,failed_attempts,device_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (username, email, generate_password_hash(password), "user", 0, confirmation_code, 500.0, 0, ""))
                 conn.commit()
-            flash("Account created. Your verification code is " + code, "success")
+            flash(f"Your account was created. Save this one-time confirmation code: {confirmation_code}", "success")
             return redirect(url_for("verify", email=email))
-        except sqlite3.IntegrityError:
-            flash("Username or email already exists.", "danger")
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            flash("That username or email is already unavailable." if isinstance(exc, sqlite3.IntegrityError) else str(exc), "danger")
     return render_template("register.html")
 
 @app.route("/verify", methods=["GET", "POST"])
 def verify():
     email = request.args.get("email", "") or request.form.get("email", "")
     if request.method == "POST":
-        code = request.form.get("code", "")
         with db() as conn:
-            user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-            # [INTENTIONAL-VULNERABILITY: Account Verification - predictable code, no expiry or attempt limit]
-            if user and code == user["verification_code"]:
-                conn.execute("UPDATE users SET is_verified=1 WHERE id=?", (user["id"],)); conn.commit(); flash("Account verified.", "success"); return redirect(url_for("login"))
-        flash("Invalid verification code.", "danger")
+            user = conn.execute("SELECT * FROM users WHERE email=?", (email.lower(),)).fetchone()
+            if user and user["verification_code"] and hmac.compare_digest(request.form.get("code", ""), user["verification_code"]):
+                conn.execute("UPDATE users SET is_verified=1,verification_code=NULL WHERE id=?", (user["id"],))
+                conn.commit()
+                flash("Your account is confirmed. You can now sign in.", "success")
+                return redirect(url_for("login"))
+        flash("That confirmation code is invalid or has already been used.", "danger")
     return render_template("verify.html", email=email)
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        username, password = request.form.get("username", ""), request.form.get("password", "")
+        username = request.form.get("username", "").strip()
         with db() as conn:
-            # [INTENTIONAL-VULNERABILITY: SQL Injection - login query is assembled from user input]
-            sql = "SELECT * FROM users WHERE username='" + username + "' AND password_hash='" + password + "'"
-            try:
-                user = conn.execute(sql).fetchone()
-            except sqlite3.Error as exc:
-                return render_template("error.html", error=str(exc)), 500
-            if user:
-                session["user_id"] = user["id"]
-                session["role"] = user["role"]
-                session["device_id"] = request.form.get("device_id", "")
-                conn.execute("UPDATE users SET last_login_ip=? WHERE id=?", (request.remote_addr, user["id"])); conn.commit()
+            user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            if user and check_password_hash(user["password_hash"], request.form.get("password", "")):
+                if not user["is_verified"]:
+                    flash("Confirm your account before signing in.", "warning")
+                    return redirect(url_for("verify", email=user["email"]))
+                session.clear()
+                session["user_id"], session["csrf_token"] = user["id"], secrets.token_urlsafe(32)
+                conn.execute("UPDATE users SET failed_attempts=0,last_login_ip=? WHERE id=?", (request.remote_addr, user["id"]))
+                conn.commit()
                 audit("login", user["id"], "successful login")
-                flash("Welcome back, " + user["username"] + "!", "success")
-                return redirect(url_for("index"))
-            audit("failed_login", None, username)
-            flash("Invalid credentials.", "danger")
+                flash(f"Welcome back, {user['username']}!", "success")
+                target = request.args.get("next", "")
+                return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("index"))
+            if user:
+                conn.execute("UPDATE users SET failed_attempts=failed_attempts+1 WHERE id=?", (user["id"],))
+                conn.commit()
+        audit("failed_login", None, username)
+        flash("Invalid credentials.", "danger")
     return render_template("login.html")
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
+@login_required
 def logout():
-    audit("logout", session.get("user_id")); session.clear(); return redirect(url_for("index"))
+    audit("logout", current_user()["id"])
+    session.clear()
+    flash("You have been signed out.", "success")
+    return redirect(url_for("index"))
 
 @app.route("/profile", methods=["GET", "POST"])
+@login_required
 def profile():
     user = current_user()
-    if not user: return redirect(url_for("login"))
     if request.method == "POST":
-        with db() as conn:
-            conn.execute("UPDATE users SET username=?,email=? WHERE id=?", (request.form.get("username", user["username"]), request.form.get("email", user["email"]), user["id"])); conn.commit()
-        return redirect(url_for("profile"))
-    return render_template("profile.html", user=user)
-
-def cart_items():
-    cart = session.get("cart", {})
-    if not cart: return []
-    ids = [int(x) for x in cart]
-    placeholders = ",".join("?" for _ in ids)
+        try:
+            username, email = validate_username(request.form.get("username")), validate_email(request.form.get("email"))
+            with db() as conn:
+                conn.execute("UPDATE users SET username=?,email=? WHERE id=?", (username, email, user["id"]))
+                conn.commit()
+            flash("Your profile has been updated.", "success")
+            return redirect(url_for("profile"))
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            flash("That username or email is already unavailable." if isinstance(exc, sqlite3.IntegrityError) else str(exc), "danger")
     with db() as conn:
-        rows = conn.execute("SELECT * FROM products WHERE id IN (" + placeholders + ")", ids).fetchall()
-    return [(p, cart.get(str(p["id"]), 0)) for p in rows]
+        orders = conn.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 5", (user["id"],)).fetchall()
+    return render_template("profile.html", user=current_user(), orders=orders)
 
 @app.route("/cart")
 def cart():
-    return render_template("cart.html", items=cart_items())
+    items = cart_items()
+    return render_template("cart.html", items=items, total=sum(p["price"] * q for p, q in items))
 
 @app.route("/cart/add", methods=["POST"])
 def cart_add():
-    pid = request.form.get("product_id", "")
-    cart = session.setdefault("cart", {})
-    cart[pid] = cart.get(pid, 0) + int(request.form.get("quantity", 1)); session.modified=True
-    return redirect(url_for("cart"))
+    try:
+        pid, quantity = int(request.form.get("product_id", "")), positive_int(request.form.get("quantity", 1))
+        with db() as conn:
+            product = conn.execute("SELECT stock FROM products WHERE id=?", (pid,)).fetchone()
+        if not product or product["stock"] < 1:
+            raise ValueError
+        cart = session.get("cart", {})
+        if int(cart.get(str(pid), 0)) + quantity > product["stock"]:
+            flash(f"Only {product['stock']} of this product are available.", "danger")
+        else:
+            cart[str(pid)] = int(cart.get(str(pid), 0)) + quantity
+            session["cart"] = cart
+            flash("Added to your cart.", "success")
+    except (ValueError, TypeError):
+        flash("Choose a valid quantity for an available product.", "danger")
+    return redirect(request.referrer or url_for("products"))
 
 @app.route("/cart/update", methods=["POST"])
 def cart_update():
-    cart = session.setdefault("cart", {})
-    for key, value in request.form.items():
-        if key.startswith("qty_"):
-            # [INTENTIONAL-VULNERABILITY: Quantity Manipulation - negative/zero/huge quantities accepted]
-            cart[key[4:]] = int(value)
-    session.modified=True; return redirect(url_for("cart"))
+    cart = session.get("cart", {})
+    try:
+        with db() as conn:
+            for key, value in request.form.items():
+                if key.startswith("qty_"):
+                    pid, quantity = int(key[4:]), int(value)
+                    product = conn.execute("SELECT stock FROM products WHERE id=?", (pid,)).fetchone()
+                    if not product or quantity < 0 or quantity > product["stock"]:
+                        raise ValueError
+                    if quantity: cart[str(pid)] = quantity
+                    else: cart.pop(str(pid), None)
+        session["cart"] = cart
+        flash("Your cart has been updated.", "success")
+    except (ValueError, TypeError):
+        flash("Cart quantities must be between zero and the available stock.", "danger")
+    return redirect(url_for("cart"))
 
 @app.route("/cart/remove", methods=["POST"])
 def cart_remove():
-    session.get("cart", {}).pop(request.form.get("product_id", ""), None); session.modified=True; return redirect(url_for("cart"))
+    cart = session.get("cart", {})
+    cart.pop(request.form.get("product_id", ""), None)
+    session["cart"] = cart
+    flash("Item removed from your cart.", "success")
+    return redirect(url_for("cart"))
 
 @app.route("/checkout", methods=["GET", "POST"])
+@login_required
 def checkout():
     user = current_user()
-    if not user: return redirect(url_for("login"))
-    items = cart_items()
-    if request.method == "POST" and request.form.get("product_id"):
-        with db() as conn:
-            product = conn.execute("SELECT * FROM products WHERE id=?", (request.form.get("product_id"),)).fetchone()
-        if product:
-            items = [(product, int(request.form.get("quantity", 1)))]
     if request.method == "POST":
-        if request.form.get("total") is not None:
-            total = float(request.form.get("total", "0"))
-        elif request.form.get("unit_price") is not None:
-            total = float(request.form.get("unit_price")) * int(request.form.get("quantity", 1))
-        else:
-            total = 0.0
-        coupon = request.form.get("coupon", "")
-        with db() as conn:
-            c = conn.execute("SELECT * FROM coupons WHERE code=?", (coupon,)).fetchone() if coupon else None
-            if c: total = total * (100 - c["discount_percent"]) / 100
-            # [INTENTIONAL-VULNERABILITY: Price Manipulation - client supplied total is trusted]
-            cur = conn.execute("INSERT INTO orders(user_id,total_amount,coupon_used,status,created_at) VALUES (?,?,?,?,?)", (user["id"],total,coupon,"created",datetime.utcnow().isoformat()))
-            oid = cur.lastrowid
-            for p, qty in items:
-                # [INTENTIONAL-VULNERABILITY: Business Logic - client-controlled negative quantities reach order items]
-                conn.execute("INSERT INTO order_items(order_id,product_id,quantity,unit_price) VALUES (?,?,?,?)", (oid,p["id"],qty,request.form.get("price_"+str(p["id"]), p["price"])))
-            if c:
-                # [INTENTIONAL-VULNERABILITY: Coupon Race - read/update is not atomic]
-                conn.execute("UPDATE coupons SET is_used=1, usage_count=usage_count+1 WHERE id=?", (c["id"],))
-            conn.commit()
-        audit("order_created", user["id"], str(oid)); session["cart"]={}
-        if request.form.get("product_id"):
-            return jsonify({"order_id": oid, "total": total}), 200
-        return redirect(url_for("order_detail", order_id=oid))
-    total = sum(p["price"] * qty for p, qty in items)
-    return render_template("checkout.html", items=items, total=total)
+        try:
+            with db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                fresh_user = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+                items = cart_items(conn)
+                if not items: raise ValueError("Your cart is empty.")
+                subtotal = round(sum(p["price"] * q for p, q in items), 2)
+                for product, quantity in items:
+                    live = conn.execute("SELECT stock FROM products WHERE id=?", (product["id"],)).fetchone()
+                    if not live or not 1 <= quantity <= live["stock"]:
+                        raise ValueError(f"{product['name']} no longer has enough stock.")
+                coupon, coupon_error = eligible_coupon(conn, request.form.get("coupon"), fresh_user, subtotal)
+                if coupon_error: raise ValueError(coupon_error)
+                discount = round(subtotal * coupon["discount_percent"] / 100, 2) if coupon else 0
+                total = round(subtotal - discount, 2)
+                if fresh_user["store_credit"] + 1e-9 < total:
+                    raise ValueError("Your store credit is insufficient for this order.")
+                order_id = conn.execute("INSERT INTO orders(user_id,total_amount,coupon_used,status,created_at) VALUES (?,?,?,?,?)",
+                    (user["id"], total, coupon["code"] if coupon else "", "paid", now().isoformat())).lastrowid
+                for product, quantity in items:
+                    conn.execute("INSERT INTO order_items(order_id,product_id,quantity,unit_price) VALUES (?,?,?,?)",
+                                 (order_id, product["id"], quantity, product["price"]))
+                    conn.execute("UPDATE products SET stock=stock-? WHERE id=?", (quantity, product["id"]))
+                if coupon and conn.execute("UPDATE coupons SET usage_count=usage_count+1,is_used=CASE WHEN usage_count+1>=max_uses THEN 1 ELSE 0 END WHERE id=? AND usage_count<max_uses", (coupon["id"],)).rowcount != 1:
+                    raise ValueError("That coupon was just redeemed. Please review your order.")
+                conn.execute("UPDATE users SET store_credit=store_credit-? WHERE id=?", (total, user["id"]))
+                conn.commit()
+            session["cart"] = {}
+            audit("order_created", user["id"], f"order={order_id}; total={total:.2f}")
+            flash("Your order has been placed and paid with store credit.", "success")
+            return redirect(url_for("order_detail", order_id=order_id))
+        except (ValueError, sqlite3.Error) as exc:
+            flash(str(exc) if isinstance(exc, ValueError) else "We could not complete your order. Please try again.", "danger")
+    items = cart_items()
+    return render_template("checkout.html", items=items, subtotal=round(sum(p["price"] * q for p, q in items), 2))
 
 @app.route("/orders")
+@login_required
 def orders():
-    user = current_user()
-    if not user: return redirect(url_for("login"))
-    with db() as conn: rows = conn.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC", (current_user()["id"],)).fetchall()
     return render_template("orders.html", orders=rows)
 
 @app.route("/orders/<int:order_id>")
+@login_required
 def order_detail(order_id):
     user = current_user()
-    if not user: return redirect(url_for("login"))
     with db() as conn:
-        # [INTENTIONAL-VULNERABILITY: IDOR - ownership is not checked]
-        order = conn.execute("SELECT orders.*, users.username FROM orders LEFT JOIN users ON users.id=orders.user_id WHERE orders.id=?", (order_id,)).fetchone()
-        items = conn.execute("SELECT oi.*,p.name FROM order_items oi JOIN products p ON p.id=oi.product_id WHERE order_id=?", (order_id,)).fetchall()
-    if not order: return "Order not found",404
+        if user["role"] == "admin":
+            order = conn.execute("SELECT orders.*,users.username FROM orders JOIN users ON users.id=orders.user_id WHERE orders.id=?", (order_id,)).fetchone()
+        else:
+            order = conn.execute("SELECT orders.*,users.username FROM orders JOIN users ON users.id=orders.user_id WHERE orders.id=? AND orders.user_id=?", (order_id, user["id"])).fetchone()
+        items = conn.execute("SELECT oi.*,p.name FROM order_items oi JOIN products p ON p.id=oi.product_id WHERE oi.order_id=?", (order_id,)).fetchall() if order else []
+    if not order: abort(404)
     return render_template("order.html", order=order, items=items)
 
 @app.route("/newsletter", methods=["GET", "POST"])
 def newsletter():
-    if request.method == "POST": flash("Thanks for subscribing.", "success")
+    if request.method == "POST":
+        try:
+            email = validate_email(request.form.get("email"))
+            with db() as conn:
+                existing = conn.execute("SELECT coupon_code FROM newsletter_subscribers WHERE email=?", (email,)).fetchone()
+                if existing:
+                    flash(f"You are already subscribed. Your welcome coupon is {existing['coupon_code']}.", "info")
+                else:
+                    code = "NEWS" + secrets.token_hex(4).upper()
+                    conn.execute("INSERT INTO coupons(code,discount_percent,is_used,usage_count,assigned_email,expires_at,max_uses,min_purchase) VALUES (?,?,0,0,?,?,?,?)",
+                        (code, 10, email, (now() + timedelta(days=30)).isoformat(), 1, 0))
+                    conn.execute("INSERT INTO newsletter_subscribers(email,coupon_code,subscribed_at) VALUES (?,?,?)", (email, code, now().isoformat()))
+                    conn.commit()
+                    flash(f"You are subscribed! Your 10% welcome coupon is {code}.", "success")
+            return redirect(url_for("newsletter"))
+        except ValueError as exc:
+            flash(str(exc), "danger")
     return render_template("newsletter.html")
 
 @app.route("/admin")
+@admin_required
 def admin():
-    # [INTENTIONAL-VULNERABILITY: Broken Access Control - role from client session is trusted]
-    if session.get("role") != "admin": return "Admin dashboard", 200
-    with db() as conn: stats = {"users":conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"],"orders":conn.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"]}
+    with db() as conn:
+        stats = {key: conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
+                 for key, table in {"users": "users", "orders": "orders", "products": "products"}.items()}
     return render_template("admin.html", stats=stats)
 
 @app.route("/admin/users")
+@admin_required
 def admin_users():
-    # [INTENTIONAL-VULNERABILITY: Missing Authorization - sensitive route lacks an auth check]
-    with db() as conn: users = conn.execute("SELECT id,username,email,role,is_verified,store_credit FROM users").fetchall()
+    with db() as conn:
+        users = conn.execute("SELECT id,username,email,role,is_verified,store_credit FROM users ORDER BY id").fetchall()
     return render_template("admin_users.html", users=users)
 
+@app.route("/admin/users/<int:user_id>", methods=["POST"])
+@admin_required
+def admin_user_update(user_id):
+    try:
+        role, credit = request.form.get("role"), money(request.form.get("store_credit"))
+        if role not in {"user", "admin"}: raise ValueError("Choose a valid role.")
+        if user_id == current_user()["id"] and role != "admin": raise ValueError("You cannot remove your own administrator access.")
+        with db() as conn:
+            conn.execute("UPDATE users SET role=?,store_credit=?,is_verified=? WHERE id=?",
+                         (role, credit, 1 if request.form.get("is_verified") else 0, user_id))
+            conn.commit()
+        flash("User account updated.", "success")
+    except ValueError as exc: flash(str(exc), "danger")
+    return redirect(url_for("admin_users"))
+
+def product_values():
+    name, description = (request.form.get("name") or "").strip(), (request.form.get("description") or "").strip()
+    if not name or len(name) > 120 or len(description) > 2000: raise ValueError("Use a product name and a description within the allowed length.")
+    try:
+        stock = int(request.form.get("stock"))
+    except (TypeError, ValueError):
+        raise ValueError("Enter a valid stock quantity.")
+    if not 0 <= stock <= 100000:
+        raise ValueError("Stock must be between 0 and 100,000.")
+    return name, description, money(request.form.get("price")), stock, secure_filename(request.form.get("image_filename", ""))
+
 @app.route("/admin/products", methods=["GET", "POST"])
+@admin_required
 def admin_products():
     if request.method == "POST":
-        with db() as conn: conn.execute("INSERT INTO products(name,description,price,stock,image_filename) VALUES (?,?,?,?,?)", (request.form.get("name"),request.form.get("description"),float(request.form.get("price",0)),int(request.form.get("stock",0)),request.form.get("image_filename",""))); conn.commit()
-    with db() as conn: rows=conn.execute("SELECT * FROM products").fetchall()
+        try:
+            with db() as conn: conn.execute("INSERT INTO products(name,description,price,stock,image_filename) VALUES (?,?,?,?,?)", product_values()); conn.commit()
+            flash("Product created.", "success")
+        except ValueError as exc: flash(str(exc), "danger")
+    with db() as conn: rows = conn.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
     return render_template("admin_products.html", products=rows)
 
+@app.route("/admin/products/<int:product_id>", methods=["POST"])
+@admin_required
+def admin_product_update(product_id):
+    try:
+        with db() as conn: conn.execute("UPDATE products SET name=?,description=?,price=?,stock=?,image_filename=? WHERE id=?", (*product_values(), product_id)); conn.commit()
+        flash("Product updated.", "success")
+    except ValueError as exc: flash(str(exc), "danger")
+    return redirect(url_for("admin_products"))
+
+@app.route("/admin/products/<int:product_id>/delete", methods=["POST"])
+@admin_required
+def admin_product_delete(product_id):
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM products WHERE id=?", (product_id,))
+            conn.commit()
+        flash("Product removed.", "success")
+    except sqlite3.IntegrityError:
+        flash("This product is retained because it appears in an order history.", "warning")
+    return redirect(url_for("admin_products"))
+
+def coupon_values():
+    code = (request.form.get("code") or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{4,32}", code): raise ValueError("Coupon codes use 4–32 uppercase letters, numbers, dashes, or underscores.")
+    email = (request.form.get("email") or "").strip().lower()
+    expiry = (request.form.get("expires_at") or "").strip()
+    if email: email = validate_email(email)
+    if expiry: expiry = datetime.fromisoformat(expiry).replace(tzinfo=timezone.utc).isoformat()
+    return code, positive_int(request.form.get("discount"), "discount", 100), email, expiry, positive_int(request.form.get("max_uses", 1), "maximum uses", 100000), money(request.form.get("min_purchase", 0))
+
 @app.route("/admin/coupons", methods=["GET", "POST"])
+@admin_required
 def admin_coupons():
     if request.method == "POST":
-        with db() as conn: conn.execute("INSERT INTO coupons(code,discount_percent,is_used,assigned_email) VALUES (?,?,0,?)", (request.form.get("code"),int(request.form.get("discount",0)),request.form.get("email",""))); conn.commit()
-    with db() as conn: rows=conn.execute("SELECT * FROM coupons").fetchall()
+        try:
+            code, discount, email, expiry, maximum, minimum = coupon_values()
+            with db() as conn: conn.execute("INSERT INTO coupons(code,discount_percent,is_used,usage_count,assigned_email,expires_at,max_uses,min_purchase) VALUES (?,?,0,0,?,?,?,?)", (code, discount, email, expiry, maximum, minimum)); conn.commit()
+            flash("Coupon created.", "success")
+        except (ValueError, sqlite3.IntegrityError) as exc: flash("Coupon code already exists." if isinstance(exc, sqlite3.IntegrityError) else str(exc), "danger")
+    with db() as conn: rows = conn.execute("SELECT * FROM coupons ORDER BY id DESC").fetchall()
     return render_template("admin_coupons.html", coupons=rows)
 
+@app.route("/admin/coupons/<int:coupon_id>", methods=["POST"])
+@admin_required
+def admin_coupon_update(coupon_id):
+    try:
+        code, discount, email, expiry, maximum, minimum = coupon_values()
+        with db() as conn: conn.execute("UPDATE coupons SET code=?,discount_percent=?,assigned_email=?,expires_at=?,max_uses=?,min_purchase=?,is_used=CASE WHEN usage_count>=? THEN 1 ELSE 0 END WHERE id=?", (code, discount, email, expiry, maximum, minimum, maximum, coupon_id)); conn.commit()
+        flash("Coupon updated.", "success")
+    except (ValueError, sqlite3.IntegrityError) as exc: flash("Coupon code already exists." if isinstance(exc, sqlite3.IntegrityError) else str(exc), "danger")
+    return redirect(url_for("admin_coupons"))
+
+@app.route("/admin/coupons/<int:coupon_id>/delete", methods=["POST"])
+@admin_required
+def admin_coupon_delete(coupon_id):
+    with db() as conn: conn.execute("DELETE FROM coupons WHERE id=?", (coupon_id,)); conn.commit()
+    flash("Coupon removed.", "success")
+    return redirect(url_for("admin_coupons"))
+
+def safe_file(directory, name):
+    candidate = (directory / secure_filename(name)).resolve()
+    if candidate.parent != directory.resolve() or not candidate.is_file(): abort(404)
+    return candidate
+
 @app.route("/files")
-def files():
-    name = request.args.get("name", "")
-    # [INTENTIONAL-VULNERABILITY: Path Traversal - user path is joined without containment validation]
-    path = os.path.join(UPLOAD_DIR, name)
-    if not os.path.isfile(path): return "File not found", 404
-    return send_file(path)
-
+def files(): return send_file(safe_file(UPLOAD_DIR, request.args.get("name", "")))
 @app.route("/download")
-def download():
-    name = request.args.get("name", "")
-    # [INTENTIONAL-VULNERABILITY: Path Traversal - no canonical containment validation]
-    path = os.path.join(BASE_DIR, "demo_files", name)
-    if not os.path.isfile(path): return "File not found", 404
-    return send_file(path)
+def download(): return send_file(safe_file(DEMO_DIR, request.args.get("name", "")))
 
-@app.route("/context-login", methods=["GET", "POST"])
-def context_login():
-    if request.method == "GET":
-        return render_template("context_login.html", decision=None)
-    passkey = request.form.get("passkey_verified", "false") == "true"
-    hour = int(request.form.get("hour", 12))
-    # [INTENTIONAL-VULNERABILITY: Context Authentication - client assertions are accepted as policy inputs]
-    location_ok = request.form.get("location_allowed", "true") == "true"
-    time_ok = request.form.get("time_allowed", "true") == "true" or 8 <= hour <= 22
-    label = "ALLOW" if passkey and location_ok and time_ok else ("BLOCK (passkey)" if not passkey else "BLOCK (location)" if not location_ok else "BLOCK (time)")
-    return render_template("context_login.html", decision={"label":label,"distance_km":0 if location_ok else 9999,"location_ok":location_ok,"time_ok":time_ok})
+@app.errorhandler(400)
+def bad_request(error): return render_template("error.html", title="Request could not be completed", message="Your request was invalid or your form expired. Please go back and try again."), 400
+@app.errorhandler(403)
+def forbidden(error): return render_template("error.html", title="Access denied", message="You do not have permission to view this page."), 403
+@app.errorhandler(404)
+def not_found(error): return render_template("error.html", title="Page not found", message="The page or item you requested is unavailable."), 404
+@app.errorhandler(500)
+def internal_error(error): return render_template("error.html", title="Something went wrong", message="Please try again in a moment."), 500
 
-@app.route("/context-auth", methods=["POST"])
-def context_auth():
-    user = current_user()
-    if not user: return jsonify({"decision":"BLOCK (authentication)"}), 401
-    passkey = request.form.get("passkey_verified", "false") == "true"
-    lat, lon = float(request.form.get("latitude", 0)), float(request.form.get("longitude", 0))
-    # [INTENTIONAL-VULNERABILITY: Context Authentication - client controls passkey, coordinates, and time]
-    with db() as conn:
-        registered = conn.execute("SELECT latitude,longitude FROM registered_locations WHERE user_id=?", (user["id"],)).fetchone()
-    distance = haversine_km(registered["latitude"], registered["longitude"], lat, lon) if registered else 9999
-    # [INTENTIONAL-VULNERABILITY: Context Authentication - client boolean can override calculated location policy]
-    location_allowed = request.form.get("location_allowed", "true") == "true"
-    time_allowed = request.form.get("time_allowed", "true") == "true"
-    decision = "ALLOW" if passkey and location_allowed and time_allowed else ("BLOCK (passkey)" if not passkey else "BLOCK (location)" if not location_allowed else "BLOCK (time)")
-    audit("context_auth", user["id"], decision + " lat=" + str(lat) + " lon=" + str(lon))
-    return jsonify({"decision":decision,"distance_km":round(distance, 2),"passkey_allowed":passkey,"location_allowed":location_allowed,"time_allowed":time_allowed})
-
-@app.route("/behavior")
-def behavior():
-    user = current_user()
-    if not user: return redirect(url_for("login"))
-    with db() as conn: rows=conn.execute("SELECT typing_speed,request_ms,device_id,created_at FROM login_behavior WHERE user_id=?",(user["id"],)).fetchall()
-    values=[r["typing_speed"] for r in rows]
-    mean=statistics.mean(values) if values else 0; stdev=statistics.pstdev(values) if len(values)>1 else 0
-    return render_template("behavior.html", rows=rows, mean=mean, stdev=stdev)
-
-@app.errorhandler(Exception)
-def verbose_error(error):
-    # [INTENTIONAL-VULNERABILITY: Information Disclosure - verbose exception details are rendered]
-    return render_template("error.html", error=repr(error)), 500
-
+migrate_database()
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5000")), debug=False)
