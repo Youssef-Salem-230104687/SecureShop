@@ -207,7 +207,10 @@ def review(product_id):
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    form_data = {"username": "", "email": ""}
     if request.method == "POST":
+        form_data = {"username": (request.form.get("username") or "").strip(),
+                     "email": (request.form.get("email") or "").strip()}
         try:
             username, email = validate_username(request.form.get("username")), validate_email(request.form.get("email"))
             password = request.form.get("password", "")
@@ -222,7 +225,7 @@ def register():
             return redirect(url_for("verify", email=email))
         except (ValueError, sqlite3.IntegrityError) as exc:
             flash("That username or email is already unavailable." if isinstance(exc, sqlite3.IntegrityError) else str(exc), "danger")
-    return render_template("register.html")
+    return render_template("register.html", form_data=form_data)
 
 @app.route("/verify", methods=["GET", "POST"])
 def verify():
